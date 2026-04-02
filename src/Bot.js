@@ -4,7 +4,6 @@
 import "dotenv/config";
 import { createRestAPIClient, createStreamingAPIClient } from "masto";
 import {
-  ACTIONS,
   applyActions,
   buildStatusLine,
   validateSchedule,
@@ -18,6 +17,7 @@ import {
   hasSubmittedThisTurn,
   isEnded,
 } from "./storage.js";
+import { getActions } from "./sheets.js";
 
 const GM_ID        = process.env.GM_ACCOUNT_ID ?? "";
 const BOT_TOKEN    = process.env.MASTODON_TOKEN;
@@ -69,7 +69,6 @@ function splitText(text, limit) {
 }
 
 // -- [키워드] / [키워드/값] 파싱 -----------------------------------
-// 메시지에서 [ ] 로 감싸인 명령을 모두 추출
 function parseTokens(content) {
   const plain   = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   const matches = [...plain.matchAll(/\[([^\]]+)\]/g)];
@@ -94,7 +93,7 @@ async function handleNotification(notification) {
 
   // -- [상태] -------------------------------------------------------
   if (tokens.some((t) => t.key === "상태")) {
-    const player = getPlayer(accountId, displayName);
+    const player = await getPlayer(accountId, displayName);
     await reply(notification, buildStatusLine(player));
     return;
   }
@@ -104,41 +103,37 @@ async function handleNotification(notification) {
 
   if (scheduleTokens.length > 0) {
 
-    // 종료 확인
-    if (isEnded(accountId, displayName)) {
+    if (await isEnded(accountId, displayName)) {
       await reply(notification, "커뮤니티가 이미 종료되었습니다.");
       return;
     }
 
-    // 중복 제출 확인
-    if (hasSubmittedThisTurn(accountId, displayName)) {
+    if (await hasSubmittedThisTurn(accountId, displayName)) {
       await reply(notification, "이번 턴 행동을 이미 제출했습니다.");
       return;
     }
 
-    const player  = getPlayer(accountId, displayName);
+    const player  = await getPlayer(accountId, displayName);
     const age     = getAge(player.turn);
     const actions = scheduleTokens.map((t) => t.value).filter(Boolean);
 
-    // 유효성 검사
-    const errors = validateSchedule(actions, age);
+    const errors = await validateSchedule(actions, age);
     if (errors.length > 0) {
       await reply(notification, `제출 실패\n${errors.join("\n")}`);
       return;
     }
 
-    // 즉시 처리
-    const updated = processPlayer(accountId, (p) => applyActions(p, actions));
+    const updated     = await processPlayer(accountId, (p) => applyActions(p, actions));
     if (!updated) return;
 
     const lastHistory = updated.history.at(-1);
+    const ACTIONS     = await getActions();
 
-    // 결과 텍스트 생성
     const actionLines = lastHistory.log.map((entry) => {
       const parts = [];
       if (entry.changes.length > 0) parts.push(entry.changes.join(", "));
-      if (entry.goldDelta !== 0)     parts.push(`골드${entry.goldDelta > 0 ? "+" : ""}${entry.goldDelta}G`);
-      if (entry.note)                parts.push(`(${entry.note})`);
+      if (entry.goldDelta !== 0)    parts.push(`골드${entry.goldDelta > 0 ? "+" : ""}${entry.goldDelta}G`);
+      if (entry.note)               parts.push(`(${entry.note})`);
       return `  ${entry.action}: ${parts.join(" / ") || entry.note || "-"}`;
     }).join("\n");
 
@@ -149,13 +144,11 @@ async function handleNotification(notification) {
       buildStatusLine(updated),
     ].join("\n");
 
-    // 결과 공개 게시
     await rest.v1.statuses.create({
       status:     resultText.slice(0, 490),
       visibility: "public",
     });
 
-    // 무사수행 선택 시 봇이 DM 발신
     if (actions.includes("무사수행")) {
       await rest.v1.statuses.create({
         status:     `@${acct} 무사수행을 선택했습니다. 무사수행 봇에서 진행해주세요.`,
@@ -175,7 +168,7 @@ async function handleNotification(notification) {
 
   // [현황]
   if (tokens.some((t) => t.key === "현황")) {
-    const players = getAllPlayers();
+    const players = await getAllPlayers();
     if (players.length === 0) {
       await reply(notification, "등록된 플레이어가 없습니다.");
       return;
@@ -192,7 +185,7 @@ async function handleNotification(notification) {
   // [상세] / [상세/이름]
   if (tokens.some((t) => t.key === "상세")) {
     const targetName = tokens.find((t) => t.key === "상세")?.value;
-    const players    = getAllPlayers();
+    const players    = await getAllPlayers();
     const list       = targetName
       ? players.filter((p) => p.name === targetName)
       : players;
@@ -212,23 +205,24 @@ async function handleNotification(notification) {
     return;
   }
 
-  // [강제진행] — GM이 미제출 플레이어를 강제로 다음 턴으로 넘김
+  // [강제진행] — 미제출 플레이어 턴 강제 진행
   if (tokens.some((t) => t.key === "강제진행")) {
-    const players = getAllPlayers().filter((p) => {
+    const players = await getAllPlayers();
+    const targets = players.filter((p) => {
       const lastTurn = p.history.at(-1)?.turn ?? 0;
       return lastTurn < p.turn;
     });
 
-    if (players.length === 0) {
+    if (targets.length === 0) {
       await reply(notification, "처리할 플레이어가 없습니다.");
       return;
     }
 
-    for (const p of players) {
-      updatePlayer({ ...p, turn: p.turn + 1 });
+    for (const p of targets) {
+      await updatePlayer({ ...p, turn: p.turn + 1 });
     }
 
-    await reply(notification, `${players.length}명을 강제로 다음 턴으로 넘겼습니다.`);
+    await reply(notification, `${targets.length}명을 강제로 다음 턴으로 넘겼습니다.`);
     return;
   }
 

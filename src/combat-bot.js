@@ -106,6 +106,26 @@ function parseTokens(content) {
 }
 
 // ================================================================
+// 강제 귀환 처리 — 체력 0 시 호출
+// ================================================================
+async function forceReturn(accountId, acct, session, player, penaltyNote) {
+  const penalty = Math.floor(player.gold * 0.1);
+  await updatePlayer({ ...player, gold: Math.max(0, player.gold - penalty) });
+  clearDungeonSession(accountId);
+
+  const lines = [
+    `[강제 귀환]`,
+    `${session.location}에서 쓰러져 아카데미로 돌아왔습니다.`,
+    penaltyNote ?? "",
+    `골드 패널티: -${penalty}G`,
+    ``,
+    `무사수행이 종료되었습니다.`,
+  ].filter(Boolean);
+
+  await sendDM(acct, lines.join("\n"));
+}
+
+// ================================================================
 // 이벤트 큐 생성
 // ================================================================
 async function buildEventQueue(location, age) {
@@ -201,29 +221,31 @@ function buildEventPrompt(event, session) {
   }
 }
 
-// 탐험 종료 요약
+// ================================================================
+// 탐험 정상 종료
+// ================================================================
 async function finishDungeon(accountId, acct, session, player) {
-  const summary = [
-    `[무사수행 완료] ${session.location}`,
-    `획득 골드: ${session.goldEarned}G`,
-    session.itemsFound.length > 0
-      ? `획득 아이템: ${session.itemsFound.join(", ")}`
-      : "",
-    `HP: ${session.playerHp}/${session.playerMaxHp}`,
-  ].filter(Boolean).join("\n");
-
-  const newGold     = player.gold + session.goldEarned;
+  const newGold      = player.gold + session.goldEarned;
   const newInventory = [...(player.inventory ?? []), ...session.itemsFound];
   await updatePlayer({ ...player, gold: newGold, inventory: newInventory });
   clearDungeonSession(accountId);
 
-  await sendDM(acct, summary);
+  const lines = [
+    `[무사수행 완료] ${session.location}`,
+    `획득 골드: ${session.goldEarned}G`,
+    session.itemsFound.length > 0 ? `획득 아이템: ${session.itemsFound.join(", ")}` : "",
+    `HP: ${session.playerHp}/${session.playerMaxHp}`,
+  ].filter(Boolean);
+
+  await sendDM(acct, lines.join("\n"));
   await postPublic(
     `[무사수행 완료] ${player.name}이(가) ${session.location} 탐험을 마쳤습니다. 획득 골드: ${session.goldEarned}G`
   );
 }
 
+// ================================================================
 // 다음 이벤트 전송 또는 탐험 종료
+// ================================================================
 async function sendNextEvent(accountId, acct, player) {
   const session = getDungeonSession(accountId);
   if (!session) return;
@@ -233,7 +255,7 @@ async function sendNextEvent(accountId, acct, player) {
     return;
   }
 
-  const next = advanceEvent(accountId);
+  const next    = advanceEvent(accountId);
   const updated = getDungeonSession(accountId);
   await sendDM(acct, buildEventPrompt(next, updated));
 }
@@ -259,7 +281,7 @@ export async function startAdventure(accountId, acct, displayName, location) {
 
   const playerHp   = calcHp(player.stats.체력);
   const eventQueue = await buildEventQueue(location, age);
-  const session    = createDungeonSession(accountId, location, playerHp, eventQueue);
+  createDungeonSession(accountId, location, playerHp, eventQueue);
 
   await sendDM(acct, [
     `[무사수행 시작] ${location}`,
@@ -267,7 +289,6 @@ export async function startAdventure(accountId, acct, displayName, location) {
     `탐험 이벤트: ${TOTAL_EVENTS}개`,
   ].join("\n"));
 
-  // 첫 이벤트 전송
   await sendNextEvent(accountId, acct, player);
 }
 
@@ -287,39 +308,35 @@ async function handleNotification(notification) {
 
   if (tokens.length === 0) return;
 
-  const player  = await getPlayer(accountId, displayName);
-  const session = getDungeonSession(accountId);
-
   // ================================================================
   // DM 탐험 명령
   // ================================================================
   if (isDM) {
-    if (!session) {
-      await reply(notification, "진행 중인 무사수행이 없습니다.");
-      return;
-    }
+    const session = getDungeonSession(accountId);
 
-    const event = session.currentEvent;
+    // 세션 없음 — 응답 없음 (강제 귀환 이후 포함)
+    if (!session) return;
+
+    const player = await getPlayer(accountId, displayName);
+    const event  = session.currentEvent;
 
     // -- 전투 중 ---------------------------------------------------
     if (session.phase === "battle") {
-      const battle = session.currentBattle;
+      const battle = { ...session.currentBattle };
 
       // [공격]
       if (tokens.some((t) => t.key === "공격")) {
-        const playerAtk = player.hidden.전투;
-        const playerDmg = calcDamage(playerAtk, battle.defense ?? 0);
+        const playerDmg = calcDamage(player.hidden.전투, battle.defense ?? 0);
         battle.hp       = Math.max(0, battle.hp - playerDmg);
 
         const lines = [`내가 공격! ${battle.name}에게 ${playerDmg} 데미지`];
 
-        // 적 사망
         if (battle.hp <= 0) {
           const gold = randomBetween(battle.goldMin ?? 0, battle.goldMax ?? 0);
-          const updated = updateSession(accountId, (s) => ({
+          updateSession(accountId, (s) => ({
             ...s,
-            goldEarned:   s.goldEarned + gold,
-            phase:        "event",
+            goldEarned:    s.goldEarned + gold,
+            phase:         "event",
             currentBattle: null,
           }));
           lines.push(`${battle.name}을(를) 쓰러뜨렸습니다!`, `${gold}G 획득`);
@@ -328,26 +345,21 @@ async function handleNotification(notification) {
           return;
         }
 
-        // 적 반격
         const enemyDmg = calcDamage(battle.attack ?? 5, 0);
         const newHp    = Math.max(0, session.playerHp - enemyDmg);
         lines.push(`${battle.name}의 반격! ${enemyDmg} 데미지`);
         lines.push(`내 HP: ${newHp}/${session.playerMaxHp}  ${battle.name} HP: ${battle.hp}/${battle.maxHp}`);
 
-        // 플레이어 사망
         if (newHp <= 0) {
-          const penalty = Math.floor(player.gold * 0.1);
-          await updatePlayer({ ...player, gold: Math.max(0, player.gold - penalty) });
-          clearDungeonSession(accountId);
-          lines.push(`쓰러졌습니다. ${penalty}G 손실.`);
           await sendDM(acct, lines.join("\n"));
+          await forceReturn(accountId, acct, session, player, `${battle.name}에게 쓰러졌습니다.`);
           return;
         }
 
         updateSession(accountId, (s) => ({
           ...s,
-          playerHp:     newHp,
-          currentBattle: { ...battle },
+          playerHp:      newHp,
+          currentBattle: battle,
         }));
         lines.push("\n  [공격]\n  [도망]");
         await sendDM(acct, lines.join("\n"));
@@ -357,6 +369,7 @@ async function handleNotification(notification) {
       // [도망]
       if (tokens.some((t) => t.key === "도망")) {
         const success = Math.random() < 0.55;
+
         if (success) {
           updateSession(accountId, (s) => ({ ...s, phase: "event", currentBattle: null }));
           await sendDM(acct, "도망에 성공했습니다.");
@@ -366,17 +379,15 @@ async function handleNotification(notification) {
           const newHp    = Math.max(0, session.playerHp - enemyDmg);
 
           if (newHp <= 0) {
-            const penalty = Math.floor(player.gold * 0.1);
-            await updatePlayer({ ...player, gold: Math.max(0, player.gold - penalty) });
-            clearDungeonSession(accountId);
-            await sendDM(acct, `도망 실패! ${enemyDmg} 데미지를 입고 쓰러졌습니다. ${penalty}G 손실.`);
+            await sendDM(acct, `도망 실패! ${battle.name}에게 ${enemyDmg} 데미지를 입었습니다.`);
+            await forceReturn(accountId, acct, session, player, `${battle.name}에게 쓰러졌습니다.`);
             return;
           }
 
           updateSession(accountId, (s) => ({
             ...s,
-            playerHp:     newHp,
-            currentBattle: { ...battle },
+            playerHp:      newHp,
+            currentBattle: battle,
           }));
           await sendDM(acct, [
             `도망 실패! ${enemyDmg} 데미지`,
@@ -389,22 +400,16 @@ async function handleNotification(notification) {
         return;
       }
 
-      await reply(notification, "전투 중입니다.\n  [공격]\n  [도망]");
+      // 전투 중 다른 키워드는 무시
       return;
     }
 
     // -- 이벤트 단계 -----------------------------------------------
-    if (!event) {
-      await reply(notification, "현재 이벤트가 없습니다.");
-      return;
-    }
+    if (!event) return;
 
     // [열기] — 보물상자
     if (tokens.some((t) => t.key === "열기")) {
-      if (event.type !== "treasure") {
-        await reply(notification, "보물상자가 없습니다.");
-        return;
-      }
+      if (event.type !== "treasure") return;
 
       const lines = ["보물상자를 열었습니다!"];
 
@@ -416,10 +421,7 @@ async function handleNotification(notification) {
 
         if (itemPool.length > 0) {
           const found = itemPool[Math.floor(Math.random() * itemPool.length)];
-          updateSession(accountId, (s) => ({
-            ...s,
-            itemsFound: [...s.itemsFound, found],
-          }));
+          updateSession(accountId, (s) => ({ ...s, itemsFound: [...s.itemsFound, found] }));
           lines.push(`아이템 획득: ${found}`);
         } else {
           const gold = randomBetween(20, 80);
@@ -439,26 +441,21 @@ async function handleNotification(notification) {
 
     // [지나간다.] — 보물상자 무시
     if (tokens.some((t) => t.key === "지나간다.")) {
-      if (event.type !== "treasure") {
-        await reply(notification, "지나칠 것이 없습니다.");
-        return;
-      }
+      if (event.type !== "treasure") return;
       await sendDM(acct, "보물상자를 지나쳤습니다.");
       await sendNextEvent(accountId, acct, player);
       return;
     }
 
-    // [대화] — 주민 / 몬스터 / 보스
+    // [대화]
     if (tokens.some((t) => t.key === "대화")) {
-      if (!["villager", "monster", "boss"].includes(event.type)) {
-        await reply(notification, "대화할 상대가 없습니다.");
-        return;
-      }
-      const d        = event.data;
+      if (!["villager", "monster", "boss"].includes(event.type)) return;
+
+      const d = event.data;
       const response = d.dialogue ?? "...말이 없습니다.";
 
       if (event.type === "villager") {
-        const gold = randomBetween(0, 30);
+        const gold  = randomBetween(0, 30);
         const lines = [`${d.name}: "${response}"`];
         if (gold > 0) {
           updateSession(accountId, (s) => ({ ...s, goldEarned: s.goldEarned + gold }));
@@ -467,9 +464,8 @@ async function handleNotification(notification) {
         await sendDM(acct, lines.join("\n"));
         await sendNextEvent(accountId, acct, player);
       } else {
-        // 몬스터/보스와 대화 — 성공 시 전투 회피, 실패 시 기습
-        const success = Math.random() < 0.4;
-        if (success) {
+        // 몬스터/보스 — 40% 성공 시 회피, 실패 시 기습
+        if (Math.random() < 0.4) {
           await sendDM(acct, `${d.name}: "${response}"\n대화에 성공해 위기를 넘겼습니다.`);
           await sendNextEvent(accountId, acct, player);
         } else {
@@ -477,18 +473,17 @@ async function handleNotification(notification) {
           const newHp    = Math.max(0, session.playerHp - enemyDmg);
 
           if (newHp <= 0) {
-            const penalty = Math.floor(player.gold * 0.1);
-            await updatePlayer({ ...player, gold: Math.max(0, player.gold - penalty) });
-            clearDungeonSession(accountId);
-            await sendDM(acct, `${d.name}: "${response}"\n기습을 받아 쓰러졌습니다! ${penalty}G 손실.`);
+            await sendDM(acct, `${d.name}: "${response}"\n기습을 받았습니다! ${enemyDmg} 데미지`);
+            await forceReturn(accountId, acct, session, player, `${d.name}의 기습에 쓰러졌습니다.`);
             return;
           }
 
+          const enemy = { ...d, hp: d.hp, maxHp: d.maxHp };
           updateSession(accountId, (s) => ({
             ...s,
             phase:        "battle",
             playerHp:     newHp,
-            currentBattle: { ...d },
+            currentBattle: enemy,
           }));
           await sendDM(acct, [
             `${d.name}: "${response}"`,
@@ -503,12 +498,9 @@ async function handleNotification(notification) {
       return;
     }
 
-    // [공격] — 이벤트 단계에서 바로 공격 (주민 포함)
+    // [공격] — 이벤트 단계 (주민 포함)
     if (tokens.some((t) => t.key === "공격")) {
-      if (!["villager", "monster", "boss"].includes(event.type)) {
-        await reply(notification, "공격할 대상이 없습니다.");
-        return;
-      }
+      if (!["villager", "monster", "boss"].includes(event.type)) return;
 
       const d = event.data;
 
@@ -516,13 +508,9 @@ async function handleNotification(notification) {
       if (event.type === "villager") {
         const stolen = randomBetween(10, 50);
         updateSession(accountId, (s) => ({ ...s, goldEarned: s.goldEarned + stolen }));
-        // 숨김 수치 도덕성 감소
         await updatePlayer({
           ...player,
-          hidden: {
-            ...player.hidden,
-            도덕성: Math.max(0, player.hidden.도덕성 - 5),
-          },
+          hidden: { ...player.hidden, 도덕성: Math.max(0, player.hidden.도덕성 - 5) },
         });
         await sendDM(acct, [
           `${d.name}을(를) 공격해 ${stolen}G를 빼앗았습니다.`,
@@ -532,63 +520,52 @@ async function handleNotification(notification) {
         return;
       }
 
-      // 몬스터 / 보스 — 전투 시작
-      updateSession(accountId, (s) => ({
-        ...s,
-        phase:        "battle",
-        currentBattle: { ...d },
-      }));
+      // 몬스터/보스 선제공격
+      const enemy     = { ...d };
+      const playerDmg = calcDamage(player.hidden.전투, enemy.defense ?? 0);
+      enemy.hp        = Math.max(0, enemy.hp - playerDmg);
 
-      const playerAtk = player.hidden.전투;
-      const playerDmg = calcDamage(playerAtk, d.defense ?? 0);
-      d.hp            = Math.max(0, d.hp - playerDmg);
+      const lines = [`${enemy.name}을(를) 선제공격! ${playerDmg} 데미지`];
 
-      const lines = [`${d.name}을(를) 선제공격! ${playerDmg} 데미지`];
-
-      if (d.hp <= 0) {
-        const gold = randomBetween(d.goldMin ?? 0, d.goldMax ?? 0);
+      if (enemy.hp <= 0) {
+        const gold = randomBetween(enemy.goldMin ?? 0, enemy.goldMax ?? 0);
         updateSession(accountId, (s) => ({
           ...s,
           goldEarned:    s.goldEarned + gold,
           phase:         "event",
           currentBattle: null,
         }));
-        lines.push(`${d.name}을(를) 쓰러뜨렸습니다!`, `${gold}G 획득`);
+        lines.push(`${enemy.name}을(를) 쓰러뜨렸습니다!`, `${gold}G 획득`);
         await sendDM(acct, lines.join("\n"));
         await sendNextEvent(accountId, acct, player);
         return;
       }
 
-      const enemyDmg = calcDamage(d.attack ?? 5, 0);
+      const enemyDmg = calcDamage(enemy.attack ?? 5, 0);
       const newHp    = Math.max(0, session.playerHp - enemyDmg);
-      lines.push(`${d.name}의 반격! ${enemyDmg} 데미지`);
-      lines.push(`내 HP: ${newHp}/${session.playerMaxHp}  ${d.name} HP: ${d.hp}/${d.maxHp}`);
+      lines.push(`${enemy.name}의 반격! ${enemyDmg} 데미지`);
+      lines.push(`내 HP: ${newHp}/${session.playerMaxHp}  ${enemy.name} HP: ${enemy.hp}/${enemy.maxHp}`);
 
       if (newHp <= 0) {
-        const penalty = Math.floor(player.gold * 0.1);
-        await updatePlayer({ ...player, gold: Math.max(0, player.gold - penalty) });
-        clearDungeonSession(accountId);
-        lines.push(`쓰러졌습니다. ${penalty}G 손실.`);
         await sendDM(acct, lines.join("\n"));
+        await forceReturn(accountId, acct, session, player, `${enemy.name}에게 쓰러졌습니다.`);
         return;
       }
 
       updateSession(accountId, (s) => ({
         ...s,
+        phase:        "battle",
         playerHp:     newHp,
-        currentBattle: { ...d },
+        currentBattle: enemy,
       }));
       lines.push("\n  [공격]\n  [도망]");
       await sendDM(acct, lines.join("\n"));
       return;
     }
 
-    // [숨기] — 주민 / 몬스터 / 보스
+    // [숨기]
     if (tokens.some((t) => t.key === "숨기")) {
-      if (!["villager", "monster", "boss"].includes(event.type)) {
-        await reply(notification, "숨을 필요가 없습니다.");
-        return;
-      }
+      if (!["villager", "monster", "boss"].includes(event.type)) return;
 
       const d       = event.data;
       const success = Math.random() < 0.65;
@@ -601,18 +578,17 @@ async function handleNotification(notification) {
         const newHp    = Math.max(0, session.playerHp - enemyDmg);
 
         if (newHp <= 0) {
-          const penalty = Math.floor(player.gold * 0.1);
-          await updatePlayer({ ...player, gold: Math.max(0, player.gold - penalty) });
-          clearDungeonSession(accountId);
-          await sendDM(acct, `숨기 실패! ${d.name}에게 발각되어 ${enemyDmg} 데미지를 입고 쓰러졌습니다. ${penalty}G 손실.`);
+          await sendDM(acct, `숨기 실패! ${d.name}에게 발각되었습니다. ${enemyDmg} 데미지`);
+          await forceReturn(accountId, acct, session, player, `${d.name}에게 쓰러졌습니다.`);
           return;
         }
 
+        const enemy = { ...d };
         updateSession(accountId, (s) => ({
           ...s,
           phase:        "battle",
           playerHp:     newHp,
-          currentBattle: { ...d },
+          currentBattle: enemy,
         }));
         await sendDM(acct, [
           `숨기 실패! ${d.name}에게 발각되었습니다. ${enemyDmg} 데미지`,
@@ -625,13 +601,14 @@ async function handleNotification(notification) {
       return;
     }
 
-    await reply(notification, "알 수 없는 명령입니다.");
+    // DM 중 알 수 없는 키워드는 무시
     return;
   }
 
   // ================================================================
   // 퍼블릭 — 레이드
   // ================================================================
+  const player = await getPlayer(accountId, displayName);
 
   const raidToken = tokens.find((t) => t.key === "레이드");
   if (raidToken) {
@@ -639,22 +616,18 @@ async function handleNotification(notification) {
       await reply(notification, "레이드 개설은 GM만 가능합니다.");
       return;
     }
-
     const bossName = raidToken.value;
     if (!bossName) {
       await reply(notification, "사용법: [레이드/보스명]");
       return;
     }
-
     const existing = getActiveRaid();
     if (existing) {
       await reply(notification, `이미 진행 중인 레이드가 있습니다: ${existing.bossName}`);
       return;
     }
-
     const bossData = { hp: 500, attack: 20, defense: 10, reward: 300 };
     const raid     = createRaid(bossName, bossData);
-
     await postPublic(
       `[레이드 모집] ${bossName}\nHP: ${raid.bossHp}\n\n[참가] 로 레이드에 참여하세요!`
     );
@@ -717,7 +690,7 @@ async function handleNotification(notification) {
     return;
   }
 
-  // 레이드 공격 (퍼블릭 [공격])
+  // 레이드 [공격]
   if (tokens.some((t) => t.key === "공격")) {
     const raid = getActiveRaid();
     if (raid && raid.phase === "battle" && raid.participants[accountId]) {
@@ -758,13 +731,51 @@ async function handleNotification(notification) {
       return;
     }
 
-    // 결투 공격으로 이어짐
+    // 결투 [공격]
+    const duel = getDuelByAccount(accountId);
+    if (duel && duel.phase === "battle") {
+      if (duel.currentTurn !== accountId) {
+        await reply(notification, "상대방의 차례입니다.");
+        return;
+      }
+
+      const isChallenger = duel.challengerId === accountId;
+      const oppHpKey     = isChallenger ? "targetHp"     : "challengerHp";
+      const myName       = isChallenger ? duel.challengerName : duel.targetName;
+      const oppName      = isChallenger ? duel.targetName     : duel.challengerName;
+      const oppAcct      = isChallenger ? duel.targetAcct     : duel.challengerAcct;
+      const oppId        = isChallenger ? duel.targetId       : duel.challengerId;
+
+      const dmg      = calcDamage(player.hidden.전투, 0);
+      duel[oppHpKey] = Math.max(0, duel[oppHpKey] - dmg);
+
+      const lines = [
+        `${myName}의 공격! ${dmg} 데미지`,
+        `${oppName} HP: ${duel[oppHpKey]}`,
+      ];
+
+      if (duel[oppHpKey] <= 0) {
+        duel.phase = "ended";
+        setDuel(duel);
+        lines.push(`\n${myName} 승리!`);
+        await postPublic(lines.join("\n"));
+        return;
+      }
+
+      duel.currentTurn = oppId;
+      setDuel(duel);
+      lines.push(`\n@${oppAcct} [공격] 차례입니다.`);
+      await postPublic(lines.join("\n"));
+      return;
+    }
+
+    await reply(notification, "참가 중인 레이드 또는 결투가 없습니다.");
+    return;
   }
 
   // ================================================================
   // 퍼블릭 — 1:1 결투
   // ================================================================
-
   const duelToken = tokens.find((t) => t.key === "결투");
   if (duelToken) {
     const targetAcct = duelToken.value;
@@ -776,7 +787,6 @@ async function handleNotification(notification) {
       await reply(notification, "이미 진행 중인 결투가 있습니다.");
       return;
     }
-
     const challenger = { accountId, name: displayName, acct, stats: player.stats };
     createDuel(challenger, targetAcct);
     await postPublic(
@@ -799,49 +809,6 @@ async function handleNotification(notification) {
     await postPublic(
       `[결투 시작]\n${pending.challengerName} vs ${displayName}\n\n${pending.challengerName}의 선공! [공격] 을 입력하세요.`
     );
-    return;
-  }
-
-  // 결투 공격
-  if (tokens.some((t) => t.key === "공격")) {
-    const duel = getDuelByAccount(accountId);
-    if (!duel || duel.phase !== "battle") {
-      await reply(notification, "진행 중인 결투가 없습니다.");
-      return;
-    }
-    if (duel.currentTurn !== accountId) {
-      await reply(notification, "상대방의 차례입니다.");
-      return;
-    }
-
-    const isChallenger = duel.challengerId === accountId;
-    const myHpKey      = isChallenger ? "challengerHp" : "targetHp";
-    const oppHpKey     = isChallenger ? "targetHp"     : "challengerHp";
-    const myName       = isChallenger ? duel.challengerName : duel.targetName;
-    const oppName      = isChallenger ? duel.targetName     : duel.challengerName;
-    const oppAcct      = isChallenger ? duel.targetAcct     : duel.challengerAcct;
-    const oppId        = isChallenger ? duel.targetId       : duel.challengerId;
-
-    const dmg        = calcDamage(player.hidden.전투, 0);
-    duel[oppHpKey]   = Math.max(0, duel[oppHpKey] - dmg);
-
-    const lines = [
-      `${myName}의 공격! ${dmg} 데미지`,
-      `${oppName} HP: ${duel[oppHpKey]}`,
-    ];
-
-    if (duel[oppHpKey] <= 0) {
-      duel.phase = "ended";
-      setDuel(duel);
-      lines.push(`\n${myName} 승리!`);
-      await postPublic(lines.join("\n"));
-      return;
-    }
-
-    duel.currentTurn = oppId;
-    setDuel(duel);
-    lines.push(`\n@${oppAcct} [공격] 차례입니다.`);
-    await postPublic(lines.join("\n"));
     return;
   }
 

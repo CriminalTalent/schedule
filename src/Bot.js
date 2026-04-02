@@ -3,22 +3,10 @@
 // ============================================================
 import "dotenv/config";
 import { createRestAPIClient, createStreamingAPIClient } from "masto";
-import { startAdventure } from "./combat-bot.js";
-import {
-  applyActions,
-  buildStatusLine,
-  validateSchedule,
-  getAge,
-} from "./game.js";
-import {
-  getPlayer,
-  updatePlayer,
-  getAllPlayers,
-  processPlayer,
-  hasSubmittedThisTurn,
-  isEnded,
-} from "./storage.js";
-import { getActions } from "./sheets.js";
+import { applyActions, buildStatusLine, validateSchedule, getAge } from "./game.js";
+import { getPlayer, updatePlayer, getAllPlayers, processPlayer, hasSubmittedThisTurn, isEnded } from "./storage.js";
+import { getActions }        from "./sheets.js";
+import { startAdventure }    from "./combat-bot.js";
 
 const GM_ID        = process.env.GM_ACCOUNT_ID ?? "";
 const BOT_TOKEN    = process.env.MASTODON_TOKEN;
@@ -48,7 +36,6 @@ async function init() {
 async function reply(notification, text) {
   const chunks = splitText(text, 480);
   let replyId  = notification.status?.id;
-
   for (const chunk of chunks) {
     const status = await rest.v1.statuses.create({
       status:      `@${notification.account.acct} ${chunk}`,
@@ -69,13 +56,17 @@ function splitText(text, limit) {
   return chunks;
 }
 
-// -- [키워드] / [키워드/값] 파싱 -----------------------------------
+// -- 파싱: [키워드] / [키워드/값] / [키워드/값/(서브)] -------------
 function parseTokens(content) {
   const plain   = content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   const matches = [...plain.matchAll(/\[([^\]]+)\]/g)];
   return matches.map((m) => {
     const parts = m[1].split("/");
-    return { key: parts[0].trim(), value: parts[1]?.trim() ?? null };
+    return {
+      key:   parts[0].trim(),
+      value: parts[1]?.trim() ?? null,
+      sub:   parts[2]?.replace(/[()]/g, "").trim() ?? null,
+    };
   });
 }
 
@@ -99,16 +90,15 @@ async function handleNotification(notification) {
     return;
   }
 
-  // -- [스케줄/행동명] x3 자동 처리 ---------------------------------
+  // -- [스케줄/행동명] x3 -------------------------------------------
+  // 무사수행은 [스케줄/무사수행/(지역명)] 형식
   const scheduleTokens = tokens.filter((t) => t.key === "스케줄");
 
   if (scheduleTokens.length > 0) {
-
     if (await isEnded(accountId, displayName)) {
       await reply(notification, "커뮤니티가 이미 종료되었습니다.");
       return;
     }
-
     if (await hasSubmittedThisTurn(accountId, displayName)) {
       await reply(notification, "이번 턴 행동을 이미 제출했습니다.");
       return;
@@ -116,14 +106,26 @@ async function handleNotification(notification) {
 
     const player  = await getPlayer(accountId, displayName);
     const age     = getAge(player.turn);
-    const actions = scheduleTokens.map((t) => t.value).filter(Boolean);
 
+    // 행동명 추출 (무사수행은 value로, 지역은 sub로 분리 보관)
+    const actions       = scheduleTokens.map((t) => t.value).filter(Boolean);
+    const adventureToken = scheduleTokens.find((t) => t.value === "무사수행");
+    const adventureLocation = adventureToken?.sub ?? null;
+
+    // 무사수행에 지역이 없으면 거부
+    if (actions.includes("무사수행") && !adventureLocation) {
+      await reply(notification, "무사수행은 지역을 지정해야 합니다.\n예) [스케줄/무사수행/(서부사막)]");
+      return;
+    }
+
+    // 유효성 검사
     const errors = await validateSchedule(actions, age);
     if (errors.length > 0) {
       await reply(notification, `제출 실패\n${errors.join("\n")}`);
       return;
     }
 
+    // 즉시 처리
     const updated     = await processPlayer(accountId, (p) => applyActions(p, actions));
     if (!updated) return;
 
@@ -150,11 +152,13 @@ async function handleNotification(notification) {
       visibility: "public",
     });
 
-    if (actions.includes("무사수행")) {
-      await startAdventure(accountId, acct, displayName);
+    await reply(notification, `${lastHistory.turn}턴 처리 완료. 결과가 공개 게시되었습니다.`);
+
+    // 무사수행 선택 시 DM 자동 발신
+    if (actions.includes("무사수행") && adventureLocation) {
+      await startAdventure(accountId, acct, displayName, adventureLocation);
     }
 
-    await reply(notification, `${lastHistory.turn}턴 처리 완료. 결과가 공개 게시되었습니다.`);
     return;
   }
 
@@ -203,7 +207,7 @@ async function handleNotification(notification) {
     return;
   }
 
-  // [강제진행] — 미제출 플레이어 턴 강제 진행
+  // [강제진행]
   if (tokens.some((t) => t.key === "강제진행")) {
     const players = await getAllPlayers();
     const targets = players.filter((p) => {
@@ -219,7 +223,6 @@ async function handleNotification(notification) {
     for (const p of targets) {
       await updatePlayer({ ...p, turn: p.turn + 1 });
     }
-
     await reply(notification, `${targets.length}명을 강제로 다음 턴으로 넘겼습니다.`);
     return;
   }
@@ -236,7 +239,6 @@ async function main() {
 
   for await (const event of stream) {
     if (event.event !== "notification") continue;
-
     const notification = event.payload;
     try {
       await handleNotification(notification);

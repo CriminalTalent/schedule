@@ -3,6 +3,7 @@
 // ============================================================
 import "dotenv/config";
 import { createRestAPIClient, createStreamingAPIClient } from "masto";
+import { startAdventure } from "./combat-bot.js";
 import {
   applyActions,
   buildStatusLine,
@@ -150,10 +151,7 @@ async function handleNotification(notification) {
     });
 
     if (actions.includes("무사수행")) {
-      await rest.v1.statuses.create({
-        status:     `@${acct} 무사수행을 선택했습니다. 무사수행 봇에서 진행해주세요.`,
-        visibility: "direct",
-      });
+      await startAdventure(accountId, acct, displayName);
     }
 
     await reply(notification, `${lastHistory.turn}턴 처리 완료. 결과가 공개 게시되었습니다.`);

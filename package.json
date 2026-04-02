@@ -1,1 +1,19 @@
-
+{
+  "name": "academy-bot",
+  "version": "0.1.0",
+  "description": "왕립 계승 아카데미 마스토돈 자동봇",
+  "type": "module",
+  "scripts": {
+    "schedule": "node src/bot.js",
+    "shop": "node src/shop-bot.js",
+    "dev:schedule": "node --watch src/bot.js",
+    "dev:shop": "node --watch src/shop-bot.js",
+    "combat": "node src/combat-bot.js",
+    "dev:combat": "node --watch src/combat-bot.js"
+  },
+  "dependencies": {
+    "masto": "^6.8.0",
+    "dotenv": "^16.4.5",
+    "googleapis": "^140.0.0"
+  }
+}

@@ -1,5 +1,5 @@
 // ============================================================
-// storage.js
+// storage.js — 플레이어 데이터 JSON 파일 저장/불러오기
 // ============================================================
 import fs   from "fs";
 import path from "path";
@@ -60,13 +60,13 @@ export function getAllPlayers() {
 export function processPlayer(accountId, applyFn) {
   const data = load();
   if (!data[accountId]) return null;
-  const processed       = applyFn(data[accountId]);
-  data[accountId]       = processed;
+  const processed        = applyFn(data[accountId]);
+  data[accountId]        = processed;
   save(data);
   return processed;
 }
 
-// 수정: applyActions 후 turn이 N+1이 되므로 last.turn === player.turn - 1 로 비교
+// 마지막 history의 turn이 현재 turn - 1이면 이미 제출한 것
 export function hasSubmittedThisTurn(accountId, displayName) {
   const player = getPlayer(accountId, displayName);
   const last   = player.history.at(-1);
